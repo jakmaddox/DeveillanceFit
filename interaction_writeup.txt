@@ -1,0 +1,53 @@
+
+╔══════════════════════════════════════════════════════════════════════║
+║                   INTERACTION MODEL WRITE-UP                         ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  Model: Linear Superposition                                         ║
+║  ─────────────────────────────                                       ║
+║  The total field is computed as the coherent (complex) sum of the    ║
+║  two individual array fields:                                        ║
+║                                                                      ║
+║      p_total(r) = p_array1(r) + p_array2(r)                          ║
+║                                                                      ║
+║  This preserves phase information: at the focal point, both beams    ║
+║  arrive in-phase → constructive interference → ~2× the individual    ║
+║  amplitude (6 dB gain). Away from focus, the relative phase varies   ║
+║  and the beams partially cancel.                                     ║
+║                                                                      ║
+║  Physical effect missed: Nonlinear acoustic interaction              ║
+║  ────────────────────────────────────────────────────────            ║
+║  At high SPLs (>140 dB, common in ultrasonic levitation), the        ║
+║  linear wave equation breaks down and the Westervelt equation        ║
+║  applies. The key nonlinear effects are:                             ║
+║                                                                      ║
+║  1. Harmonic generation: The fundamental (40 kHz) distorts into a    ║
+║     sawtooth, transferring energy to 80 kHz, 120 kHz, etc. At the    ║
+║     focal point where amplitude is highest, this steepening is       ║
+║     strongest, effectively broadening the frequency content.         ║
+║                                                                      ║
+║  2. Acoustic radiation force (Gor'kov potential): The time-averaged  ║
+║     nonlinear pressure creates a steady-state force field. In the    ║
+║     superposition of two beams, standing-wave nodes between them     ║
+║     produce trapping sites (used in acoustic levitation). Linear     ║
+║     superposition captures the interference pattern but not the      ║
+║     actual radiation force magnitude.                                ║
+║                                                                      ║
+║  3. Parametric interaction (difference frequency): When two beams    ║
+║     at slightly different frequencies intersect, nonlinearity        ║
+║     generates a difference-frequency component (demodulation).       ║
+║     Even at the same frequency, the interaction of beams from        ║
+║     different angles produces a virtual source at the intersection   ║
+║     with modified directivity. This is the basis of parametric       ║
+║     loudspeakers.                                                    ║
+║                                                                      ║
+║  Impact on field: Nonlinear effects would (a) reduce peak pressure   ║
+║  at focus below the linear prediction due to energy transfer to      ║
+║  harmonics, (b) sharpen the focal spot slightly, and (c) create a    ║
+║  time-averaged force landscape not captured by the linear model.     ║
+║                                                                      ║
+║  To model this, one would use k-Wave with medium.BonA = 0.4 (air),   ║
+║  which adds the B/A nonlinearity term to the governing equations,    ║
+║  or solve the Westervelt/KZK equation directly.                      ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║

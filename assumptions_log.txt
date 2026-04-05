@@ -1,0 +1,53 @@
+
+╔══════════════════════════════════════════════════════════════════════║
+║                          ASSUMPTIONS LOG                             ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  • Medium: Air at 20 °C, c = 343 m/s, ρ = 1.225 kg/m³                ║
+║    Justification: Standard room-temperature air properties.          ║
+║                                                                      ║
+║  • Frequency: 40 kHz (λ ≈ 8.575 mm)                                  ║
+║    Justification: Given in problem statement.                        ║
+║                                                                      ║
+║  • Element spacing: λ/2 ≈ 4.29 mm                                    ║
+║    Justification: Half-wavelength pitch is the standard choice to    ║
+║    prevent grating lobes for steering up to ±90°. Real 40 kHz        ║
+║    transducers (e.g., Murata MA40S4S, ∅10 mm) are larger, which      ║
+║    would produce grating lobes; λ/2 is the ideal-case assumption.    ║
+║                                                                      ║
+║  • Array size: 8 elements (2D cross-section of 8×8 3D array)         ║
+║    Justification: Moderate array that produces a well-defined beam   ║
+║    with ~30 mm aperture. 2D simulation uses the cross-sectional row. ║
+║                                                                      ║
+║  • Point-source model: Each element is a monopole point source       ║
+║    Justification: Element diameter (λ/2 ≈ 4.3 mm) is small relative  ║
+║    to wavelength; far-field directivity effects are negligible.      ║
+║                                                                      ║
+║  • Propagation model: 3D spherical spreading (1/r) on 2D slice       ║
+║    Justification: Physical transducers are finite objects; 3D Green's║
+║    function evaluated on a 2D plane ("2.5D") is more accurate than   ║
+║    the 2D line-source model (1/√r, Hankel function).                 ║
+║                                                                      ║
+║  • No absorption: Attenuation in air ignored                         ║
+║    Justification: At 40 kHz, α ≈ 1.4 dB/m in air. Over 15 cm path,   ║
+║    loss is ~0.2 dB — negligible for this demonstration.              ║
+║                                                                      ║
+║  • No reflections / free-field: Infinite homogeneous medium          ║
+║    Justification: Focus is on beam interaction, not room acoustics.  ║
+║    PML in k-Wave approximates this condition.                        ║
+║                                                                      ║
+║  • Steady-state (analytical): Monochromatic CW assumption            ║
+║    Justification: Transducers are narrowband; steady state is reached║
+║    within a few cycles. k-Wave provides transient validation.        ║
+║                                                                      ║
+║  • Linear superposition: p_total = p_array1 + p_array2               ║
+║    Justification: At typical ultrasonic levitation SPLs (~150 dB),   ║
+║    nonlinear effects begin to matter but linear superposition is a   ║
+║    reasonable first-order model. See interaction write-up below.     ║
+║                                                                      ║
+║  • Focusing: Geometric phase delays (no amplitude apodization)       ║
+║    Justification: Phase-only steering is standard for ultrasonic     ║
+║    phased arrays. Apodization would reduce sidelobes but also peak   ║
+║    pressure.                                                         ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║

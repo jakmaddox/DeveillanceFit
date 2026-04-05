@@ -1,0 +1,13 @@
+
+╔══════════════════════════════════════════════════════════════════════║
+║                        WHAT I'D DO NEXT                              ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  With another 2 hours,  I'd add an interactive                       ║
+║  visualization (e.g., Plotly or a small Streamlit app) that lets the ║
+║  user drag the focal point and adjust array parameters in real time, ║
+║  watching the beam pattern update — the analytical method is fast    ║
+║  enough (<100 ms) to support this, and it would make the tool far    ║
+║  more useful for design exploration.                                 ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║
