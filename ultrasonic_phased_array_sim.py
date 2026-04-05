@@ -2,18 +2,18 @@
 """
 Ultrasonic Phased Array Simulation — Deveillance Applied Physics Trial
 ======================================================================
-Two N×N transducer arrays at 40 kHz beamsteered to a common focal point.
+Simulates the 2D pressure field from two N×N transducer arrays at 40 kHz,
+beamsteered toward a common focal point, using:
+  1. Analytical Green's function (Huygens–Fresnel principle)
+  2. k-Wave pseudospectral FDTD (time-domain full-wave solver)
 
-Methods:
-  1. Analytical Green's function  — steady-state, linear + nonlinear perturbation
-  2. k-Wave pseudospectral FDTD   — time-domain, optional BonA nonlinearity
+Both approaches compute the superposition of the two beams at and around
+the focal point. The analytical method gives the steady-state monochromatic
+field; k-Wave time-steps to that same steady state while capturing transient
+effects.
 
-Nonlinear modelling:
-  • Second-harmonic generation via quasilinear perturbation
-  • Gor'kov radiation force potential (acoustic levitation landscape)
-  • k-Wave medium.BonA cumulative nonlinearity (if installed)
-
-Both methods share an identical physical domain so results overlay directly.
+Author: [Your name]
+Date:   2025
 """
 
 import numpy as np
@@ -22,240 +22,274 @@ import matplotlib.gridspec as gridspec
 from pathlib import Path
 import time
 import sys
+import os
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHYSICAL CONSTANTS & SIMULATION PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Medium — air at 20 °C
-C0   = 343.0        # speed of sound [m/s]
-RHO0 = 1.225        # density [kg/m³]
-F0   = 40_000.0     # frequency [Hz]
-OMEGA = 2 * np.pi * F0
-LAM  = C0 / F0      # wavelength ≈ 8.575 mm
-K    = 2 * np.pi / LAM
-
-# Nonlinear parameter of air
-B_OVER_2A = 0.2     # B/(2A) for air ≈ 0.2
-BETA_NL   = 1 + B_OVER_2A   # coefficient of nonlinearity ≈ 1.2
+# Medium: air at 20 °C
+C0        = 343.0          # speed of sound [m/s]
+RHO0      = 1.225          # density [kg/m³]
+F0        = 40_000.0       # operating frequency [Hz]
+WAVELENGTH = C0 / F0       # ≈ 8.575 mm
+K          = 2 * np.pi / WAVELENGTH  # wavenumber [rad/m]
 
 # Array parameters
-N_ELEM = 8          # elements per array (cross-section of NxN)
-PITCH  = LAM / 2    # λ/2 spacing ≈ 4.29 mm
-AMP    = 10.0       # source amplitude [Pa] (~154 dB SPL per element)
+N_ELEM     = 8             # N×N array → in 2D cross-section this is N elements
+PITCH      = WAVELENGTH / 2  # λ/2 element spacing ≈ 4.29 mm (prevents grating lobes)
+AMPLITUDE  = 1.0           # normalised source amplitude [Pa]
 
-# ── SHARED DOMAIN (both methods use this exact region) ──
-X_MIN, X_MAX = -0.05, 0.30    # [m]
-Y_MIN, Y_MAX = -0.20, 0.20    # [m]
-RES = 500                      # grid pixels per axis
+# Array positioning (along y-axis, separated in x)
+ARRAY1_CENTER = np.array([0.0, -0.10])    # 10 cm below focal plane
+ARRAY2_CENTER = np.array([0.0,  0.10])    # 10 cm above focal plane
+FOCAL_POINT   = np.array([0.15, 0.0])     # 15 cm to the right, on centerline
 
-# Array centres and focal point [m]
-ARRAY1_CENTER = np.array([0.0, -0.10])
-ARRAY2_CENTER = np.array([0.0,  0.10])
-FOCAL_POINT   = np.array([0.15, 0.0])
-
-# Gor'kov particle (expanded polystyrene bead, typical for levitation)
-PARTICLE_RADIUS = 1.0e-3       # 1 mm
-RHO_P  = 29.0                  # EPS density [kg/m³]
-C_P    = 900.0                 # EPS speed of sound [m/s]
+# Observation domain
+X_RANGE = (-0.05, 0.30)    # [m]
+Y_RANGE = (-0.20, 0.20)    # [m]
+RES     = 400              # grid resolution (pixels per axis)
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GEOMETRY HELPERS
+# HELPER: BUILD ARRAY ELEMENT POSITIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def make_array(center, n, pitch):
-    """N-element linear array centred at `center`, spread along x-axis."""
+def make_array(center: np.ndarray, n: int, pitch: float) -> np.ndarray:
+    """
+    Create an N-element linear array centered at `center`, spread along x-axis.
+    Returns shape (n, 2) array of [x, y] positions.
+    """
     offsets = (np.arange(n) - (n - 1) / 2) * pitch
     pos = np.zeros((n, 2))
-    pos[:, 0] = center[0] + offsets
-    pos[:, 1] = center[1]
+    pos[:, 0] = center[0] + offsets   # spread elements along x
+    pos[:, 1] = center[1]             # all at same y
     return pos
 
 
-def focusing_phases(sources, focal, k):
-    """Per-element phase phi_n = k * |r_f - r_n| for geometric focusing."""
-    return k * np.linalg.norm(sources - focal, axis=1)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# ANALYTICAL FIELD COMPUTATION
+# METHOD 1: ANALYTICAL GREEN'S FUNCTION (HUYGENS–FRESNEL)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def compute_pressure(sources, focal, X, Y, k, amp=1.0):
+def compute_focusing_phases(sources: np.ndarray, focal: np.ndarray, k: float) -> np.ndarray:
+    """
+    Compute per-element focusing phases so all contributions arrive in-phase
+    at the focal point.
+
+    Phase for element n:  φ_n = k · |r_focal − r_n|
+
+    When we apply exp(+j φ_n) to each source and propagate with
+    exp(−jk|r − r_n|), the total phase at r=focal becomes zero for every
+    element → constructive interference.
+    """
+    d = np.linalg.norm(sources - focal, axis=1)
+    return k * d
+
+
+def analytical_pressure_field(sources: np.ndarray, focal: np.ndarray,
+                               X: np.ndarray, Y: np.ndarray,
+                               k: float, amplitude: float = 1.0) -> np.ndarray:
     """
     Steady-state complex pressure from a focused point-source array.
 
-    p(r) = A * sum_n  exp(j*k*|r_f - r_n|) * exp(-j*k*|r - r_n|) / |r - r_n|
+    Uses the 3D free-space Green's function (spherical spreading, 1/r)
+    evaluated on a 2D observation plane:
 
-    Uses the 3D free-space Green's function (1/r spherical spreading)
-    evaluated on a 2D observation plane.
+        p(r) = A · Σ_n  exp(j·k·|r_f − r_n|) · exp(−j·k·|r − r_n|) / |r − r_n|
+
+    Parameters
+    ----------
+    sources : (N, 2) element positions
+    focal   : (2,)   focal point
+    X, Y    : 2D meshgrid arrays
+    k       : wavenumber
+    amplitude : source amplitude
+
+    Returns
+    -------
+    p : complex pressure field, same shape as X
     """
     Ns = len(sources)
     sx = sources[:, 0].reshape(Ns, 1, 1)
     sy = sources[:, 1].reshape(Ns, 1, 1)
 
-    r = np.sqrt((X[None] - sx)**2 + (Y[None] - sy)**2)
-    # Regularise: clamp minimum distance to lambda/4 (physical element has
-    # finite size ~PITCH, so 1/r singularity is unphysical below this scale)
-    r_min = LAM / 4
-    r = np.maximum(r, r_min)
+    # Distance from each source to every grid point
+    r = np.sqrt((X[np.newaxis] - sx)**2 + (Y[np.newaxis] - sy)**2)
+    r = np.maximum(r, 1e-10)  # regularise to avoid division by zero
 
-    phi = focusing_phases(sources, focal, k).reshape(Ns, 1, 1)
+    # Focusing phase: compensate path-length differences to focal point
+    phi = compute_focusing_phases(sources, focal, k).reshape(Ns, 1, 1)
 
-    p = amp * np.sum(np.exp(1j * phi) * np.exp(-1j * k * r) / r, axis=0)
+    # Coherent summation (Green's function with focusing weights)
+    p = amplitude * np.sum(np.exp(1j * phi) * np.exp(-1j * k * r) / r, axis=0)
     return p
 
 
-def compute_velocity(p, X, Y):
-    """
-    Acoustic particle velocity from pressure gradient (Euler equation).
-    v = -grad(p) / (j * omega * rho_0)
-    Returns (vx, vy) complex arrays.
-    """
-    dx = X[0, 1] - X[0, 0]
-    dy = Y[1, 0] - Y[0, 0]
-    dp_dx = np.gradient(p, dx, axis=1)
-    dp_dy = np.gradient(p, dy, axis=0)
-    denom = 1j * OMEGA * RHO0
-    return -dp_dx / denom, -dp_dy / denom
+def run_analytical_simulation():
+    """Run the full analytical simulation and produce plots."""
+    print("=" * 70)
+    print("METHOD 1: ANALYTICAL GREEN'S FUNCTION")
+    print("=" * 70)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NONLINEAR EFFECTS — ANALYTICAL PERTURBATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-def second_harmonic_field(p_fundamental, X, Y):
-    """
-    Quasilinear estimate of second-harmonic pressure (2f0 = 80 kHz).
-
-    In the Fubini-Blackstock perturbation framework, the second-harmonic
-    amplitude grows with propagation distance as:
-
-        |p2| ~ (beta * k * |p1|^2) / (2 * rho0 * c0^2) * sigma_eff
-
-    sigma_eff is clamped to the shock formation distance to stay within
-    the perturbation regime.
-    """
-    abs_p1 = np.abs(p_fundamental)
-    abs_p1_safe = np.maximum(abs_p1, 1e-6)
-
-    # Shock formation distance at each point
-    sigma_shock = RHO0 * C0**3 / (BETA_NL * OMEGA * abs_p1_safe)
-
-    # Distance from nearest array centre (proxy for propagation distance)
-    d1 = np.sqrt((X - ARRAY1_CENTER[0])**2 + (Y - ARRAY1_CENTER[1])**2)
-    d2 = np.sqrt((X - ARRAY2_CENTER[0])**2 + (Y - ARRAY2_CENTER[1])**2)
-    r_source = np.maximum(np.minimum(d1, d2), LAM / 4)
-
-    sigma_eff = np.minimum(r_source, sigma_shock)
-
-    p2_amplitude = (BETA_NL * K * abs_p1**2) / (2 * RHO0 * C0**2) * sigma_eff
-    p2_phase = 2 * np.angle(p_fundamental)
-    return p2_amplitude * np.exp(1j * p2_phase)
-
-
-def gorkov_potential(p, vx, vy):
-    """
-    Gor'kov radiation-force potential for a small spherical particle.
-
-    U = V_p * [ f0/(4*rho0*c0^2) * <p^2>  -  3*f1*rho0/8 * <v^2> ]
-
-    Scattering coefficients:
-        f0 = 1 - kappa_p/kappa_0
-        f1 = 2*(rho_p - rho_0)/(2*rho_p + rho_0)
-    """
-    V_p = (4 / 3) * np.pi * PARTICLE_RADIUS**3
-
-    kappa_0 = 1 / (RHO0 * C0**2)
-    kappa_p = 1 / (RHO_P * C_P**2)
-    f0 = 1 - kappa_p / kappa_0
-    f1 = 2 * (RHO_P - RHO0) / (2 * RHO_P + RHO0)
-
-    p_sq_avg = np.abs(p)**2 / 2
-    v_sq_avg = (np.abs(vx)**2 + np.abs(vy)**2) / 2
-
-    U = V_p * (f0 / (4 * RHO0 * C0**2) * p_sq_avg
-               - 3 * f1 * RHO0 / 8 * v_sq_avg)
-    return U, f0, f1
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ANALYTICAL SIMULATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_analytical():
-    print("=" * 72)
-    print("  ANALYTICAL GREEN'S FUNCTION (LINEAR + NONLINEAR PERTURBATION)")
-    print("=" * 72)
-
+    # Build arrays
     array1 = make_array(ARRAY1_CENTER, N_ELEM, PITCH)
     array2 = make_array(ARRAY2_CENTER, N_ELEM, PITCH)
 
-    print(f"\n  Geometry")
-    print(f"    Array 1: {N_ELEM} elements at y = {ARRAY1_CENTER[1]*100:+.0f} cm")
-    print(f"    Array 2: {N_ELEM} elements at y = {ARRAY2_CENTER[1]*100:+.0f} cm")
-    print(f"    Focal point: ({FOCAL_POINT[0]*100:.0f}, {FOCAL_POINT[1]*100:.0f}) cm")
-    print(f"    lam = {LAM*1e3:.2f} mm,  pitch = {PITCH*1e3:.2f} mm (lam/2)")
-    print(f"    Source amplitude: {AMP} Pa per element")
+    print(f"  Array 1: {N_ELEM} elements at y = {ARRAY1_CENTER[1]*100:.1f} cm")
+    print(f"  Array 2: {N_ELEM} elements at y = {ARRAY2_CENTER[1]*100:.1f} cm")
+    print(f"  Focal point: ({FOCAL_POINT[0]*100:.1f}, {FOCAL_POINT[1]*100:.1f}) cm")
+    print(f"  Frequency: {F0/1e3:.0f} kHz, λ = {WAVELENGTH*1e3:.2f} mm")
+    print(f"  Element pitch: {PITCH*1e3:.2f} mm (λ/2)")
 
-    for label, arr in [("Array 1", array1), ("Array 2", array2)]:
-        print(f"\n  Phase delays -- {label}:")
-        phi = focusing_phases(arr, FOCAL_POINT, K)
-        for i in range(len(arr)):
-            dist = np.linalg.norm(arr[i] - FOCAL_POINT)
-            print(f"    Elem {i}: ({arr[i,0]*1e3:+6.1f}, {arr[i,1]*1e3:+7.1f}) mm  "
-                  f"->  d = {dist*1e2:5.1f} cm  ->  phi = {np.degrees(phi[i])%360:6.1f} deg  "
-                  f"->  dt = {dist/C0*1e6:5.1f} us")
+    # Print phase delays
+    print("\n  Phase delays (Array 1):")
+    phases1 = compute_focusing_phases(array1, FOCAL_POINT, K)
+    for i, (pos, phi) in enumerate(zip(array1, phases1)):
+        print(f"    Element {i}: pos=({pos[0]*1e3:+6.1f}, {pos[1]*1e3:+6.1f}) mm, "
+              f"phase = {np.degrees(phi) % 360:6.1f}°")
 
-    # Observation grid (shared domain)
-    x = np.linspace(X_MIN, X_MAX, RES)
-    y = np.linspace(Y_MIN, Y_MAX, RES)
+    print("\n  Phase delays (Array 2):")
+    phases2 = compute_focusing_phases(array2, FOCAL_POINT, K)
+    for i, (pos, phi) in enumerate(zip(array2, phases2)):
+        print(f"    Element {i}: pos=({pos[0]*1e3:+6.1f}, {pos[1]*1e3:+6.1f}) mm, "
+              f"phase = {np.degrees(phi) % 360:6.1f}°")
+
+    # Build observation grid
+    x = np.linspace(*X_RANGE, RES)
+    y = np.linspace(*Y_RANGE, RES)
     X, Y = np.meshgrid(x, y)
 
-    print(f"\n  Domain: x in [{X_MIN*100:.0f}, {X_MAX*100:.0f}] cm, "
-          f"y in [{Y_MIN*100:.0f}, {Y_MAX*100:.0f}] cm, {RES}x{RES} grid")
-
+    # Compute individual and combined fields
     t0 = time.perf_counter()
-
-    p1 = compute_pressure(array1, FOCAL_POINT, X, Y, K, AMP)
-    p2 = compute_pressure(array2, FOCAL_POINT, X, Y, K, AMP)
-    p_lin = p1 + p2  # linear superposition
-
-    vx, vy = compute_velocity(p_lin, X, Y)
-    p2h = second_harmonic_field(p_lin, X, Y)
-
-    # Total RMS (fundamental + harmonic are at different frequencies -> incoherent sum)
-    p_total_rms = np.sqrt(np.abs(p_lin)**2 + np.abs(p2h)**2)
-
-    U_gorkov, f0_g, f1_g = gorkov_potential(p_lin, vx, vy)
-
+    p1 = analytical_pressure_field(array1, FOCAL_POINT, X, Y, K, AMPLITUDE)
+    p2 = analytical_pressure_field(array2, FOCAL_POINT, X, Y, K, AMPLITUDE)
+    p_total = p1 + p2  # LINEAR SUPERPOSITION
     dt = time.perf_counter() - t0
     print(f"\n  Computation time: {dt:.3f} s")
-    print(f"  Peak |p_linear| at focus region: {np.abs(p_lin).max():.1f} Pa")
-    print(f"  Peak |p_2nd_harmonic|: {np.abs(p2h).max():.2f} Pa "
-          f"({20*np.log10(np.abs(p2h).max()/np.abs(p_lin).max()+1e-30):.1f} dB re fundamental)")
-    print(f"  Gor'kov coefficients: f0 = {f0_g:.4f}, f1 = {f1_g:.4f}")
 
-    return dict(x=x, y=y, X=X, Y=Y,
-                p1=p1, p2=p2, p_lin=p_lin,
-                p2h=p2h, p_total_rms=p_total_rms,
-                U_gorkov=U_gorkov, vx=vx, vy=vy,
-                array1=array1, array2=array2)
+    # Convert to SPL (dB re max)
+    abs_p1 = np.abs(p1)
+    abs_p2 = np.abs(p2)
+    abs_total = np.abs(p_total)
+
+    # Reference: peak of combined field
+    p_ref = abs_total.max()
+    spl1 = 20 * np.log10(abs_p1 / p_ref + 1e-12)
+    spl2 = 20 * np.log10(abs_p2 / p_ref + 1e-12)
+    spl_total = 20 * np.log10(abs_total / p_ref + 1e-12)
+
+    # ── PLOTTING ──
+    ext = [X_RANGE[0]*100, X_RANGE[1]*100, Y_RANGE[0]*100, Y_RANGE[1]*100]
+    imkw = dict(extent=ext, origin='lower', aspect='equal', cmap='inferno')
+
+    fig = plt.figure(figsize=(20, 14))
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.30, wspace=0.30)
+
+    # -- Row 1: Individual arrays + combined (pressure magnitude) --
+    titles_row1 = ['Array 1 — |p|', 'Array 2 — |p|', 'Superposition — |p|']
+    data_row1   = [abs_p1, abs_p2, abs_total]
+    for col, (title, data) in enumerate(zip(titles_row1, data_row1)):
+        ax = fig.add_subplot(gs[0, col])
+        im = ax.imshow(data, **imkw)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.set_xlabel('x [cm]')
+        ax.set_ylabel('y [cm]')
+        # Mark arrays and focal point
+        ax.plot(array1[:, 0]*100, array1[:, 1]*100, 'c^', ms=6, label='Array 1')
+        ax.plot(array2[:, 0]*100, array2[:, 1]*100, 'gv', ms=6, label='Array 2')
+        ax.plot(FOCAL_POINT[0]*100, FOCAL_POINT[1]*100, 'w*', ms=14,
+                markeredgecolor='k', markeredgewidth=0.5, label='Focus')
+        plt.colorbar(im, ax=ax, shrink=0.8, label='Pressure [arb.]')
+        if col == 0:
+            ax.legend(loc='upper left', fontsize=8)
+
+    # -- Row 2: SPL (dB) versions --
+    titles_row2 = ['Array 1 — SPL (dB re peak)', 'Array 2 — SPL (dB re peak)',
+                   'Superposition — SPL (dB re peak)']
+    data_row2   = [spl1, spl2, spl_total]
+    for col, (title, data) in enumerate(zip(titles_row2, data_row2)):
+        ax = fig.add_subplot(gs[1, col])
+        im = ax.imshow(data, vmin=-40, vmax=0, **imkw)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.set_xlabel('x [cm]')
+        ax.set_ylabel('y [cm]')
+        ax.plot(array1[:, 0]*100, array1[:, 1]*100, 'c^', ms=6)
+        ax.plot(array2[:, 0]*100, array2[:, 1]*100, 'gv', ms=6)
+        ax.plot(FOCAL_POINT[0]*100, FOCAL_POINT[1]*100, 'w*', ms=14,
+                markeredgecolor='k', markeredgewidth=0.5)
+        plt.colorbar(im, ax=ax, shrink=0.8, label='dB')
+
+    fig.suptitle('Analytical Green\'s Function — Two 8-Element Arrays at 40 kHz\n'
+                 'Beamsteered to Common Focus via Linear Superposition',
+                 fontsize=15, fontweight='bold', y=0.98)
+
+    fig.savefig(OUTPUT_DIR / 'analytical_pressure_field.png', dpi=200,
+                bbox_inches='tight')
+    print(f"  Saved: {OUTPUT_DIR / 'analytical_pressure_field.png'}")
+    plt.close(fig)
+
+    # ── CROSS-SECTION PLOTS (through focal point) ──
+    fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Horizontal cut (y = 0)
+    iy_focal = np.argmin(np.abs(y - FOCAL_POINT[1]))
+    ax1.plot(x*100, abs_p1[iy_focal, :], 'c-', lw=1.5, label='Array 1')
+    ax1.plot(x*100, abs_p2[iy_focal, :], 'g-', lw=1.5, label='Array 2')
+    ax1.plot(x*100, abs_total[iy_focal, :], 'r-', lw=2, label='Superposition')
+    ax1.axvline(FOCAL_POINT[0]*100, color='k', ls='--', lw=1, alpha=0.5)
+    ax1.set_xlabel('x [cm]')
+    ax1.set_ylabel('|p| [arb.]')
+    ax1.set_title(f'Horizontal cut at y = {FOCAL_POINT[1]*100:.1f} cm')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Vertical cut (x = focal_x)
+    ix_focal = np.argmin(np.abs(x - FOCAL_POINT[0]))
+    ax2.plot(y*100, abs_p1[:, ix_focal], 'c-', lw=1.5, label='Array 1')
+    ax2.plot(y*100, abs_p2[:, ix_focal], 'g-', lw=1.5, label='Array 2')
+    ax2.plot(y*100, abs_total[:, ix_focal], 'r-', lw=2, label='Superposition')
+    ax2.axvline(FOCAL_POINT[1]*100, color='k', ls='--', lw=1, alpha=0.5)
+    ax2.set_xlabel('y [cm]')
+    ax2.set_ylabel('|p| [arb.]')
+    ax2.set_title(f'Vertical cut at x = {FOCAL_POINT[0]*100:.1f} cm')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    fig2.suptitle('Cross-Sections Through Focal Point', fontsize=14, fontweight='bold')
+    fig2.savefig(OUTPUT_DIR / 'analytical_cross_sections.png', dpi=200,
+                 bbox_inches='tight')
+    print(f"  Saved: {OUTPUT_DIR / 'analytical_cross_sections.png'}")
+    plt.close(fig2)
+
+    return p1, p2, p_total, X, Y
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# k-WAVE SIMULATION (with matched domain)
+# METHOD 2: k-WAVE (PSEUDOSPECTRAL FDTD TIME-DOMAIN)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_kwave(enable_nonlinear=True):
-    print("\n" + "=" * 72)
-    nl_label = " (NONLINEAR -- BonA = {:.1f})".format(2*B_OVER_2A) if enable_nonlinear else " (LINEAR)"
-    print("  k-WAVE PSEUDOSPECTRAL FDTD" + nl_label)
-    print("=" * 72)
+def run_kwave_simulation():
+    """
+    Run a k-Wave 2D simulation with two phased arrays.
+
+    NOTE: k-Wave Python (pip install k-wave-python) requires:
+      - Python ≥ 3.10
+      - On macOS: brew install fftw hdf5 zlib libomp
+      - The C++ backend auto-downloads binaries on first run
+      - Alternatively, the pure-Python backend works without binaries
+
+    The correct import paths (as of k-wave-python ≥ 0.4.0) are:
+      from kwave.kgrid   import kWaveGrid
+      from kwave.kmedium import kWaveMedium
+      from kwave.ksource import kSource
+      from kwave.ksensor import kSensor
+    """
+    print("\n" + "=" * 70)
+    print("METHOD 2: k-WAVE PSEUDOSPECTRAL FDTD")
+    print("=" * 70)
 
     try:
         from kwave.kgrid import kWaveGrid
@@ -264,453 +298,344 @@ def run_kwave(enable_nonlinear=True):
         from kwave.ksensor import kSensor
         from kwave.utils.signals import tone_burst
     except ImportError as e:
-        print(f"\n  [!] k-Wave not installed: {e}")
-        print("    pip install k-wave-python")
-        print("    macOS: brew install fftw hdf5 zlib libomp")
+        print(f"\n  ⚠ k-Wave import failed: {e}")
+        print("  Install with: pip install k-wave-python")
+        print("  On macOS also: brew install fftw hdf5 zlib libomp")
+        print("  Skipping k-Wave simulation.\n")
         return None
 
-    # Try unified API first (v0.6.0+), then legacy
-    kspaceFirstOrder, sim_api = None, None
+    # Try the unified API first (v0.6.0+), fall back to legacy
     try:
-        from kwave.kspaceFirstOrder import kspaceFirstOrder as _kfo
-        kspaceFirstOrder = _kfo
-        sim_api = "unified"
+        from kwave.kspaceFirstOrder import kspaceFirstOrder
+        use_unified = True
+        print("  Using unified kspaceFirstOrder API (v0.6.0+)")
     except ImportError:
-        pass
-    if kspaceFirstOrder is None:
         try:
-            from kwave.kspaceFirstOrder2D import kspaceFirstOrder2D as _kfo2d
+            from kwave.kspaceFirstOrder2D import kspaceFirstOrder2D
             from kwave.options.simulation_options import SimulationOptions
             from kwave.options.simulation_execution_options import SimulationExecutionOptions
-            kspaceFirstOrder = _kfo2d
-            sim_api = "legacy"
+            use_unified = False
+            print("  Using legacy kspaceFirstOrder2D API")
         except ImportError as e:
-            print(f"\n  [!] Cannot import simulation function: {e}")
+            print(f"\n  ⚠ Cannot import simulation function: {e}")
             return None
-    print(f"  Using {sim_api} API")
 
-    # Grid matched to analytical domain
-    dx = dy = 2.0e-3   # 2 mm (~4.3 PPW)
-    Nx = int(round((X_MAX - X_MIN) / dx)) + (int(round((X_MAX - X_MIN) / dx)) % 2)
-    Ny = int(round((Y_MAX - Y_MIN) / dy)) + (int(round((Y_MAX - Y_MIN) / dy)) % 2)
+    # ── Grid setup ──
+    # At 40 kHz in air, λ ≈ 8.575 mm. Need ≥ 2 PPW → dx ≤ 4.3 mm.
+    # Using dx = 1 mm for ~8.6 PPW (good accuracy).
+    dx = 1.0e-3   # 2 mm
+    dy = 1.0e-3
 
-    print(f"  Grid: {Nx} x {Ny}, dx = {dx*1e3:.1f} mm, PPW = {LAM/dx:.1f}")
+    # Domain: cover both arrays and focal region
+    # x: from −5 cm to +25 cm → 150 grid points
+    # y: from −22 cm to +22 cm → 220 grid points
+    Nx = 150
+    Ny = 220
 
+    print(f"  Grid: {Nx} × {Ny}, dx = {dx*1e3:.1f} mm")
+    print(f"  Domain: {Nx*dx*100:.0f} × {Ny*dy*100:.0f} cm")
+    print(f"  Points per wavelength: {WAVELENGTH/dx:.1f}")
+
+    # Create grid
     kgrid = kWaveGrid([Nx, Ny], [dx, dy])
 
+    # Medium
     medium = kWaveMedium(sound_speed=C0, density=RHO0)
-    if enable_nonlinear:
-        medium.BonA = 2 * B_OVER_2A
-        print(f"  Nonlinearity: B/A = {medium.BonA:.1f}")
+    medium.BonA = 0.4
 
+    # Time array — let k-Wave auto-calculate or set manually
     kgrid.makeTime(medium.sound_speed)
-    print(f"  Time steps: {kgrid.Nt}, dt = {kgrid.dt*1e6:.3f} us")
+    print(f"  Time steps: {kgrid.Nt}, dt = {kgrid.dt*1e6:.3f} µs")
+    print(f"  Total time: {kgrid.Nt * kgrid.dt * 1e4:.2f} ms")
 
-    # Physical coords -> grid indices
-    x_origin_idx = int(round(-X_MIN / dx))
-    y_origin_idx = int(round(-Y_MIN / dy))
+    # ── Source setup ──
+    # Grid origin is at center of domain. Convert physical coords to grid indices.
+    # kWaveGrid coordinate: grid center = (0, 0), indexed as (ix, iy)
+    # Physical position → grid index:
+    #   ix = Nx//2 + round(x_phys / dx)
+    #   iy = Ny//2 + round(y_phys / dy)
 
-    def phys_to_idx(pos):
-        ix = x_origin_idx + int(round(pos[0] / dx))
-        iy = y_origin_idx + int(round(pos[1] / dy))
-        return (np.clip(ix, 1, Nx-2), np.clip(iy, 1, Ny-2))
+    def phys_to_grid(pos, Nx, Ny, dx, dy):
+        ix = Nx // 2 + int(round(pos[0] / dx))
+        iy = Ny // 2 + int(round(pos[1] / dy))
+        return np.clip(ix, 0, Nx-1), np.clip(iy, 0, Ny-1)
 
     array1 = make_array(ARRAY1_CENTER, N_ELEM, PITCH)
     array2 = make_array(ARRAY2_CENTER, N_ELEM, PITCH)
     all_sources = np.vstack([array1, array2])
+    n_total = len(all_sources)
 
+    # Build source mask
     source = kSource()
     source_mask = np.zeros((Nx, Ny), dtype=np.int64)
     grid_positions = []
     for pos in all_sources:
-        ix, iy = phys_to_idx(pos)
+        ix, iy = phys_to_grid(pos, Nx, Ny, dx, dy)
         source_mask[ix, iy] = 1
         grid_positions.append((ix, iy))
+
     source.p_mask = source_mask
 
+    # Compute focusing delays for ALL elements
     distances = np.linalg.norm(all_sources - FOCAL_POINT, axis=1)
-    delays = (distances.max() - distances) / C0
+    delays_sec = distances / C0
+    delays_sec = delays_sec.max() - delays_sec  # invert: farthest fires first
 
-    # Sort by Fortran-order index
-    elem_fortran_idx = [iy * Nx + ix for (ix, iy) in grid_positions]
-    sorted_order = np.argsort(elem_fortran_idx)
-
+    # Build per-element signals with phase offsets
+    num_cycles = 5
     signals = []
-    for idx in sorted_order:
-        offset = int(round(delays[idx] / kgrid.dt))
-        try:
-            sig = tone_burst(1/kgrid.dt, F0, 10,
-                             signal_offset=offset, signal_length=kgrid.Nt)
-        except TypeError:
-            sig = np.roll(tone_burst(1/kgrid.dt, F0, 10,
-                                     signal_length=kgrid.Nt), offset)
-        signals.append(AMP * sig.flatten())
-    source.p = np.stack(signals, axis=0)
 
+    # Source points are ordered by column-major (Fortran) linear indexing of the mask.
+    # We need to map our element list to that ordering.
+    mask_indices = np.argwhere(source_mask.T.ravel() > 0)  # Fortran-order indices
+    # Actually, k-Wave uses the order of nonzero elements in the mask
+    # scanned in column-major order (y changes fastest for Fortran, but
+    # numpy default is row-major). We need to match the ordering k-Wave expects.
+    # For safety, let's build source.p indexed by the mask's nonzero order.
+
+    # Get mask indices in column-major order (as k-Wave expects)
+    fortran_flat = source_mask.ravel(order='F')
+    source_linear_idx = np.where(fortran_flat > 0)[0]
+
+    # Map each source element to its position in the fortran-order list
+    element_to_fortran = {}
+    for i, pos in enumerate(all_sources):
+        ix, iy = grid_positions[i]
+        fortran_idx = iy * Nx + ix  # column-major: col * nrows + row
+        element_to_fortran[i] = fortran_idx
+
+    # Sort elements by their Fortran-order index
+    sorted_elements = sorted(range(n_total),
+                             key=lambda i: element_to_fortran[i])
+
+    for elem_idx in sorted_elements:
+        offset_samples = int(round(delays_sec[elem_idx] / kgrid.dt))
+        try:
+            sig = tone_burst(1 / kgrid.dt, F0, num_cycles,
+                             signal_offset=offset_samples,
+                             signal_length=kgrid.Nt)
+        except TypeError:
+            # Older API might not have signal_offset; apply manually
+            sig = tone_burst(1 / kgrid.dt, F0, num_cycles,
+                             signal_length=kgrid.Nt)
+            sig = np.roll(sig, offset_samples)
+
+        signals.append(AMPLITUDE * sig.flatten())
+
+    source.p = np.stack(signals, axis=0)  # (n_sources, Nt)
+
+    # ── Sensor: record the max pressure everywhere ──
     sensor = kSensor()
     sensor.mask = np.ones((Nx, Ny), dtype=np.int64)
     sensor.record = ['p_max']
 
-    print("\n  Running k-Wave simulation...")
+    # ── Run simulation ──
+    print("\n  Running k-Wave simulation (this may take a few minutes)...")
     t0 = time.perf_counter()
+
     try:
-        if sim_api == "unified":
+        if use_unified:
             result = kspaceFirstOrder(kgrid, medium, source, sensor,
                                        pml_inside=False, quiet=True)
         else:
-            sim_opts = SimulationOptions(save_to_disk=True, pml_inside=False)
-            exec_opts = SimulationExecutionOptions()
-            result = kspaceFirstOrder(kgrid=kgrid, source=source, sensor=sensor,
-                                       medium=medium, simulation_options=sim_opts,
-                                       execution_options=exec_opts)
+            sim_options = SimulationOptions(
+                save_to_disk=True,
+                pml_inside=False,
+            )
+            exec_options = SimulationExecutionOptions()
+            result = kspaceFirstOrder2D(
+                kgrid=kgrid, source=source, sensor=sensor,
+                medium=medium,
+                simulation_options=sim_options,
+                execution_options=exec_options,
+            )
 
-        elapsed = time.perf_counter() - t0
-        print(f"  Completed in {elapsed:.1f} s")
+        dt = time.perf_counter() - t0
+        print(f"  k-Wave simulation completed in {dt:.1f} s")
 
-        p_max = result.get('p_max', result.get('p_final', None)) if isinstance(result, dict) else result
+        # Extract max pressure field
+        if isinstance(result, dict):
+            p_max = result.get('p_max', result.get('p_final', None))
+        else:
+            p_max = result
+
         if p_max is not None:
             if p_max.ndim == 1:
                 p_max = p_max.reshape((Nx, Ny))
-            x_kw = X_MIN + np.arange(Nx) * dx
-            y_kw = Y_MIN + np.arange(Ny) * dy
-            return dict(p_max=p_max, x=x_kw, y=y_kw, Nx=Nx, Ny=Ny,
-                        dx=dx, dy=dy, nonlinear=enable_nonlinear)
+
+            # Plot k-Wave result
+            fig, ax = plt.subplots(figsize=(10, 7))
+            ext = [0, Nx*dx*100, 0, Ny*dy*100]
+
+            # Shift to physical coordinates
+            x_phys = (np.arange(Nx) - Nx//2) * dx * 100
+            y_phys = (np.arange(Ny) - Ny//2) * dy * 100
+            ext = [x_phys[0], x_phys[-1], y_phys[0], y_phys[-1]]
+
+            im = ax.imshow(p_max.T, origin='lower', extent=ext,
+                          cmap='inferno', aspect='equal')
+            ax.set_xlabel('x [cm]')
+            ax.set_ylabel('y [cm]')
+            ax.set_title('k-Wave FDTD — Max Pressure (Combined Arrays)',
+                        fontsize=14, fontweight='bold')
+            ax.plot(array1[:, 0]*100, array1[:, 1]*100, 'c^', ms=6, label='Array 1')
+            ax.plot(array2[:, 0]*100, array2[:, 1]*100, 'gv', ms=6, label='Array 2')
+            ax.plot(FOCAL_POINT[0]*100, FOCAL_POINT[1]*100, 'w*', ms=14,
+                    markeredgecolor='k', markeredgewidth=0.5, label='Focus')
+            ax.legend(loc='upper left')
+            plt.colorbar(im, ax=ax, label='Max pressure [Pa]')
+
+            fig.savefig(OUTPUT_DIR / 'kwave_pressure_field.png', dpi=200,
+                        bbox_inches='tight')
+            print(f"  Saved: {OUTPUT_DIR / 'kwave_pressure_field.png'}")
+            plt.close(fig)
+            return p_max
+        else:
+            print("  ⚠ Could not extract pressure field from k-Wave result.")
+            return None
+
     except Exception as e:
-        elapsed = time.perf_counter() - t0
-        print(f"\n  [!] k-Wave failed after {elapsed:.1f} s: {e}")
-        import traceback; traceback.print_exc()
-    return None
+        dt = time.perf_counter() - t0
+        print(f"\n  ⚠ k-Wave simulation failed after {dt:.1f} s: {e}")
+        print(f"  Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        print("\n  The analytical results above are still valid.")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PLOTTING
+# ASSUMPTIONS LOG
 # ═══════════════════════════════════════════════════════════════════════════
 
-def make_plots(ana, kw_result=None):
-    ext = [X_MIN*100, X_MAX*100, Y_MIN*100, Y_MAX*100]
-    imkw = dict(extent=ext, origin='lower', aspect='equal')
-    arr1, arr2 = ana['array1'], ana['array2']
-
-    def mark(ax):
-        ax.plot(arr1[:, 0]*100, arr1[:, 1]*100, 'c^', ms=5, zorder=5)
-        ax.plot(arr2[:, 0]*100, arr2[:, 1]*100, 'gv', ms=5, zorder=5)
-        ax.plot(FOCAL_POINT[0]*100, FOCAL_POINT[1]*100, 'w*', ms=12,
-                markeredgecolor='k', markeredgewidth=0.5, zorder=6)
-
-    p_ref = np.abs(ana['p_lin']).max()
-
-    # ── Figure 1: Individual + combined linear fields ──
-    fig1, axes1 = plt.subplots(2, 3, figsize=(20, 12))
-    fields = [np.abs(ana['p1']), np.abs(ana['p2']), np.abs(ana['p_lin'])]
-    titles = ['Array 1 -- |p1|', 'Array 2 -- |p2|', 'Superposition -- |p1 + p2|']
-    for col in range(3):
-        ax = axes1[0, col]
-        im = ax.imshow(fields[col], cmap='inferno', **imkw)
-        ax.set_title(titles[col], fontsize=12, fontweight='bold')
-        ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-        plt.colorbar(im, ax=ax, shrink=0.75, label='|p| [Pa]')
-
-        ax = axes1[1, col]
-        dB = 20 * np.log10(fields[col] / p_ref + 1e-12)
-        im = ax.imshow(dB, cmap='inferno', vmin=-40, vmax=0, **imkw)
-        ax.set_title(titles[col] + ' [dB]', fontsize=12)
-        ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-        plt.colorbar(im, ax=ax, shrink=0.75, label='dB re peak')
-
-    fig1.suptitle(f'Linear Pressure Fields -- {N_ELEM}-Element Arrays at {F0/1e3:.0f} kHz\n'
-                  f'Domain: [{X_MIN*100:.0f}, {X_MAX*100:.0f}] x [{Y_MIN*100:.0f}, {Y_MAX*100:.0f}] cm  |  '
-                  f'Focus: ({FOCAL_POINT[0]*100:.0f}, {FOCAL_POINT[1]*100:.0f}) cm',
-                  fontsize=14, fontweight='bold', y=1.01)
-    fig1.tight_layout()
-    fig1.savefig(OUTPUT_DIR / '01_linear_pressure_fields.png', dpi=180, bbox_inches='tight')
-    print(f"  -> {OUTPUT_DIR / '01_linear_pressure_fields.png'}")
-    plt.close(fig1)
-
-    # ── Figure 2: Nonlinear effects ──
-    fig2 = plt.figure(figsize=(22, 10))
-    gs = gridspec.GridSpec(2, 4, figure=fig2, hspace=0.35, wspace=0.35)
-
-    ax = fig2.add_subplot(gs[0, 0])
-    im = ax.imshow(np.abs(ana['p_lin']), cmap='inferno', **imkw)
-    ax.set_title('(a) Fundamental |p1| [Pa]', fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    plt.colorbar(im, ax=ax, shrink=0.75)
-
-    ax = fig2.add_subplot(gs[0, 1])
-    im = ax.imshow(np.abs(ana['p2h']), cmap='magma', **imkw)
-    ax.set_title('(b) 2nd Harmonic |p2| [Pa]', fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    plt.colorbar(im, ax=ax, shrink=0.75)
-
-    ax = fig2.add_subplot(gs[0, 2])
-    ratio_dB = 20 * np.log10(np.abs(ana['p2h']) / (np.abs(ana['p_lin']) + 1e-12) + 1e-12)
-    im = ax.imshow(ratio_dB, cmap='RdYlBu_r', vmin=-60, vmax=0, **imkw)
-    ax.set_title('(c) |p2|/|p1| [dB]', fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    plt.colorbar(im, ax=ax, shrink=0.75, label='dB')
-
-    ax = fig2.add_subplot(gs[0, 3])
-    im = ax.imshow(ana['p_total_rms'], cmap='inferno', **imkw)
-    ax.set_title('(d) Total RMS (f0 + 2f0)', fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    plt.colorbar(im, ax=ax, shrink=0.75, label='Pa')
-
-    ax = fig2.add_subplot(gs[1, 0:2])
-    U = ana['U_gorkov']
-    U_norm = U / np.abs(U).max()
-    im = ax.imshow(U_norm, cmap='RdBu_r', vmin=-1, vmax=1, **imkw)
-    ax.set_title("(e) Gor'kov Potential (normalised) -- Levitation Landscape",
-                 fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    plt.colorbar(im, ax=ax, shrink=0.75, label='U / |U|_max')
-
-    ax = fig2.add_subplot(gs[1, 2:4])
-    Fx = -np.gradient(U, ana['x'], axis=1)
-    Fy = -np.gradient(U, ana['y'], axis=0)
-    F_mag = np.sqrt(Fx**2 + Fy**2)
-    im = ax.imshow(np.log10(F_mag + 1e-20), cmap='hot', **imkw)
-    ax.set_title('(f) Radiation Force |F| = -grad(U)  [log10 N]',
-                 fontsize=11, fontweight='bold')
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('y [cm]'); mark(ax)
-    skip = 25
-    ax.quiver(ana['X'][::skip, ::skip]*100, ana['Y'][::skip, ::skip]*100,
-              Fx[::skip, ::skip], Fy[::skip, ::skip],
-              color='cyan', alpha=0.6, scale_units='xy',
-              scale=np.abs(Fx).max()*10, headwidth=3)
-    plt.colorbar(im, ax=ax, shrink=0.75, label='log10|F| [N]')
-
-    fig2.suptitle("Nonlinear Effects -- Second-Harmonic Generation + Gor'kov Radiation Force\n"
-                  f"beta = {BETA_NL:.2f} (air),  particle: EPS bead (rho={RHO_P} kg/m3, "
-                  f"a={PARTICLE_RADIUS*1e3:.1f} mm)",
-                  fontsize=13, fontweight='bold', y=1.01)
-    fig2.savefig(OUTPUT_DIR / '02_nonlinear_effects.png', dpi=180, bbox_inches='tight')
-    print(f"  -> {OUTPUT_DIR / '02_nonlinear_effects.png'}")
-    plt.close(fig2)
-
-    # ── Figure 3: Cross-sections ──
-    x, y = ana['x'], ana['y']
-    iy_f = np.argmin(np.abs(y - FOCAL_POINT[1]))
-    ix_f = np.argmin(np.abs(x - FOCAL_POINT[0]))
-
-    fig3, axes3 = plt.subplots(2, 2, figsize=(16, 10))
-
-    ax = axes3[0, 0]
-    ax.plot(x*100, np.abs(ana['p1'])[iy_f, :], 'c-', lw=1.5, label='Array 1')
-    ax.plot(x*100, np.abs(ana['p2'])[iy_f, :], 'g-', lw=1.5, label='Array 2')
-    ax.plot(x*100, np.abs(ana['p_lin'])[iy_f, :], 'r-', lw=2.0, label='Superposition')
-    ax.axvline(FOCAL_POINT[0]*100, color='k', ls='--', lw=0.8, alpha=0.5)
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('|p| [Pa]')
-    ax.set_title(f'Horizontal cut at y = {FOCAL_POINT[1]*100:.0f} cm -- Linear')
-    ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes3[0, 1]
-    ax.plot(y*100, np.abs(ana['p1'])[:, ix_f], 'c-', lw=1.5, label='Array 1')
-    ax.plot(y*100, np.abs(ana['p2'])[:, ix_f], 'g-', lw=1.5, label='Array 2')
-    ax.plot(y*100, np.abs(ana['p_lin'])[:, ix_f], 'r-', lw=2.0, label='Superposition')
-    ax.axvline(FOCAL_POINT[1]*100, color='k', ls='--', lw=0.8, alpha=0.5)
-    ax.set_xlabel('y [cm]'); ax.set_ylabel('|p| [Pa]')
-    ax.set_title(f'Vertical cut at x = {FOCAL_POINT[0]*100:.0f} cm -- Linear')
-    ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes3[1, 0]
-    ax.plot(x*100, np.abs(ana['p_lin'])[iy_f, :], 'r-', lw=2, label='Fundamental')
-    ax.plot(x*100, np.abs(ana['p2h'])[iy_f, :], 'm--', lw=1.5, label='2nd Harmonic')
-    ax.plot(x*100, ana['p_total_rms'][iy_f, :], 'k-', lw=1.5, label='Total RMS')
-    ax.axvline(FOCAL_POINT[0]*100, color='k', ls='--', lw=0.8, alpha=0.5)
-    ax.set_xlabel('x [cm]'); ax.set_ylabel('|p| [Pa]')
-    ax.set_title('Horizontal cut -- Fundamental vs 2nd Harmonic')
-    ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes3[1, 1]
-    U_cut = ana['U_gorkov'][:, ix_f]
-    ax.plot(y*100, U_cut, 'b-', lw=2)
-    ax.set_xlabel('y [cm]'); ax.set_ylabel("U [J]")
-    ax.set_title(f"Gor'kov Potential -- Vertical cut at x = {FOCAL_POINT[0]*100:.0f} cm")
-    ax.axvline(FOCAL_POINT[1]*100, color='k', ls='--', lw=0.8, alpha=0.5)
-    ax.grid(True, alpha=0.3)
-    try:
-        from scipy.signal import argrelmin
-        minima = argrelmin(U_cut, order=5)[0]
-        if len(minima) > 0:
-            ax.plot(y[minima]*100, U_cut[minima], 'rv', ms=8,
-                    label=f'{len(minima)} trap sites')
-            ax.legend()
-    except ImportError:
-        pass
-
-    fig3.suptitle('Cross-Sections Through Focal Point', fontsize=14, fontweight='bold')
-    fig3.tight_layout()
-    fig3.savefig(OUTPUT_DIR / '03_cross_sections.png', dpi=180, bbox_inches='tight')
-    print(f"  -> {OUTPUT_DIR / '03_cross_sections.png'}")
-    plt.close(fig3)
-
-    # ── Figure 4: k-Wave comparison (if available) ──
-    if kw_result is not None:
-        fig4, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
-
-        ana_dB = 20 * np.log10(np.abs(ana['p_lin']) / p_ref + 1e-12)
-        im1 = ax1.imshow(ana_dB, cmap='inferno', vmin=-40, vmax=0, **imkw)
-        ax1.set_title("Analytical (Green's fn)", fontsize=12, fontweight='bold')
-        ax1.set_xlabel('x [cm]'); ax1.set_ylabel('y [cm]'); mark(ax1)
-        plt.colorbar(im1, ax=ax1, shrink=0.75, label='dB')
-
-        kw_ext = [kw_result['x'][0]*100, kw_result['x'][-1]*100,
-                  kw_result['y'][0]*100, kw_result['y'][-1]*100]
-        kw_ref = kw_result['p_max'].max()
-        kw_dB = 20 * np.log10(kw_result['p_max'] / kw_ref + 1e-12)
-        nl_str = "(nonlinear)" if kw_result.get('nonlinear') else "(linear)"
-        im2 = ax2.imshow(kw_dB.T, cmap='inferno', vmin=-40, vmax=0,
-                        extent=kw_ext, origin='lower', aspect='equal')
-        ax2.set_title(f'k-Wave FDTD {nl_str}', fontsize=12, fontweight='bold')
-        ax2.set_xlabel('x [cm]'); ax2.set_ylabel('y [cm]'); mark(ax2)
-        plt.colorbar(im2, ax=ax2, shrink=0.75, label='dB')
-
-        from scipy.interpolate import RegularGridInterpolator
-        interp = RegularGridInterpolator(
-            (kw_result['x'], kw_result['y']), kw_result['p_max'],
-            bounds_error=False, fill_value=0)
-        pts = np.stack([ana['X'].ravel(), ana['Y'].ravel()], axis=-1)
-        kw_interp = interp(pts).reshape(ana['X'].shape)
-        diff = np.abs(ana['p_lin']) - kw_interp
-        im3 = ax3.imshow(diff, cmap='RdBu_r', **imkw)
-        ax3.set_title('Difference (Analytical - k-Wave)', fontsize=12, fontweight='bold')
-        ax3.set_xlabel('x [cm]'); ax3.set_ylabel('y [cm]'); mark(ax3)
-        plt.colorbar(im3, ax=ax3, shrink=0.75, label='dP [Pa]')
-
-        fig4.suptitle('Method Comparison -- Same Physical Domain', fontsize=14, fontweight='bold')
-        fig4.tight_layout()
-        fig4.savefig(OUTPUT_DIR / '04_kwave_comparison.png', dpi=180, bbox_inches='tight')
-        print(f"  -> {OUTPUT_DIR / '04_kwave_comparison.png'}")
-        plt.close(fig4)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEXT DELIVERABLES
-# ═══════════════════════════════════════════════════════════════════════════
-
-ASSUMPTIONS = """\
-ASSUMPTIONS LOG
-===============
-
-* Medium: Air at 20 C, c0 = 343 m/s, rho0 = 1.225 kg/m3
-  Standard room-temperature properties; well-characterised for ultrasonics.
-
-* Frequency: 40 kHz (lambda ~ 8.575 mm)
-  Given in problem statement.
-
-* Element spacing: lambda/2 ~ 4.29 mm
-  Half-wavelength pitch prevents grating lobes for steering up to +/-90 deg.
-  Real 40 kHz transducers (Murata MA40S4S, dia 10 mm) exceed lambda/2;
-  grating lobes would appear in practice but lambda/2 is the ideal design assumption.
-
-* Array size: 8 elements per array (2D cross-section of 8x8 3D array)
-  Gives ~30 mm aperture; moderate directivity with clear beam formation.
-
-* Point-source model: Each element is a monopole point source
-  At lambda/2 element size, far-field directivity effects are negligible.
-
-* 3D spherical spreading (1/r) on a 2D observation plane
-  Physical transducers are 3D objects; the 3D Green's function on a 2D slice
-  ("2.5D") is more physically accurate than the 2D line-source model
-  (Hankel function, 1/sqrt(r) cylindrical spreading).
-
-* No absorption in linear model
-  At 40 kHz in air, alpha ~ 1.4 dB/m. Over the 18 cm path, total loss ~ 0.25 dB.
-
-* Free-field (no reflections)
-  Focus is on beam interaction physics, not room acoustics.
-  k-Wave PML boundaries approximate this condition.
-
-* Nonlinear parameter: B/(2A) = 0.2, beta = 1.2 for air
-  Standard value from Hamilton & Blackstock, Nonlinear Acoustics (1998).
-
-* Second-harmonic perturbation: Fubini-Blackstock quasilinear approximation
-  Valid pre-shock (sigma < 1). At 10 Pa source amplitude and 18 cm propagation,
-  shock distance ~ rho*c^3/(beta*omega*|p|) ~ 120 m >> path length.
-
-* Gor'kov potential: Small-particle (Rayleigh) limit, a << lambda
-  Particle radius 1 mm << lambda/2 ~ 4.3 mm; Gor'kov theory applies.
-  Particle: expanded polystyrene (rho = 29 kg/m3, c = 900 m/s).
-
-* Phase-only focusing (no amplitude apodization)
-  Standard for ultrasonic phased arrays.
-
-* Steady-state (analytical): Monochromatic CW assumption
-  40 kHz transducers are narrowband; steady state reached within a few cycles.
+ASSUMPTIONS = """
+╔══════════════════════════════════════════════════════════════════════║
+║                          ASSUMPTIONS LOG                             ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  • Medium: Air at 20 °C, c = 343 m/s, ρ = 1.225 kg/m³                ║
+║    Justification: Standard room-temperature air properties.          ║
+║                                                                      ║
+║  • Frequency: 40 kHz (λ ≈ 8.575 mm)                                  ║
+║    Justification: Given in problem statement.                        ║
+║                                                                      ║
+║  • Element spacing: λ/2 ≈ 4.29 mm                                    ║
+║    Justification: Half-wavelength pitch is the standard choice to    ║
+║    prevent grating lobes for steering up to ±90°. Real 40 kHz        ║
+║    transducers (e.g., Murata MA40S4S, ∅10 mm) are larger, which      ║
+║    would produce grating lobes; λ/2 is the ideal-case assumption.    ║
+║                                                                      ║
+║  • Array size: 8 elements (2D cross-section of 8×8 3D array)         ║
+║    Justification: Moderate array that produces a well-defined beam   ║
+║    with ~30 mm aperture. 2D simulation uses the cross-sectional row. ║
+║                                                                      ║
+║  • Point-source model: Each element is a monopole point source       ║
+║    Justification: Element diameter (λ/2 ≈ 4.3 mm) is small relative  ║
+║    to wavelength; far-field directivity effects are negligible.      ║
+║                                                                      ║
+║  • Propagation model: 3D spherical spreading (1/r) on 2D slice       ║
+║    Justification: Physical transducers are finite objects; 3D Green's║
+║    function evaluated on a 2D plane ("2.5D") is more accurate than   ║
+║    the 2D line-source model (1/√r, Hankel function).                 ║
+║                                                                      ║
+║  • No absorption: Attenuation in air ignored                         ║
+║    Justification: At 40 kHz, α ≈ 1.4 dB/m in air. Over 15 cm path,   ║
+║    loss is ~0.2 dB — negligible for this demonstration.              ║
+║                                                                      ║
+║  • No reflections / free-field: Infinite homogeneous medium          ║
+║    Justification: Focus is on beam interaction, not room acoustics.  ║
+║    PML in k-Wave approximates this condition.                        ║
+║                                                                      ║
+║  • Steady-state (analytical): Monochromatic CW assumption            ║
+║    Justification: Transducers are narrowband; steady state is reached║
+║    within a few cycles. k-Wave provides transient validation.        ║
+║                                                                      ║
+║  • Linear superposition: p_total = p_array1 + p_array2               ║
+║    Justification: At typical ultrasonic levitation SPLs (~150 dB),   ║
+║    nonlinear effects begin to matter but linear superposition is a   ║
+║    reasonable first-order model. See interaction write-up below.     ║
+║                                                                      ║
+║  • Focusing: Geometric phase delays (no amplitude apodization)       ║
+║    Justification: Phase-only steering is standard for ultrasonic     ║
+║    phased arrays. Apodization would reduce sidelobes but also peak   ║
+║    pressure.                                                         ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║
 """
 
 
-INTERACTION_WRITEUP = """\
-INTERACTION MODEL WRITE-UP
-==========================
+# ═════════════════════════════════════════════════════════════════════║
+# INTERACTION MODEL WRITE-UP║
+# ═════════════════════════════════════════════════════════════════════║
 
-Primary model: Linear superposition
-------------------------------------
-The total field is the coherent (complex) sum:
-
-    p_total(r) = p_array1(r) + p_array2(r)
-
-At the focal point both beams arrive in-phase, producing ~6 dB constructive
-interference. Away from focus the relative phase varies, creating the
-standing-wave interference fringes visible in the vertical cross-sections.
-
-Extension 1: Second-harmonic generation (nonlinear perturbation)
-----------------------------------------------------------------
-Using the Fubini-Blackstock quasilinear framework:
-
-    |p2(r)| ~ (beta * k * |p1|^2) / (2 * rho0 * c0^2) * sigma_eff
-
-where beta = 1 + B/(2A) = 1.2 for air. The second harmonic (80 kHz)
-is strongest near the focal point where the fundamental amplitude peaks.
-
-At the source amplitudes used (10 Pa, ~154 dB SPL per element), the
-second harmonic is ~45 dB below the fundamental, confirming that linear
-superposition dominates and the perturbation treatment is self-consistent.
-
-Extension 2: Gor'kov radiation force potential
------------------------------------------------
-The time-averaged radiation force on a small particle:
-
-    U = V_p * [f0 * <p^2> / (4*rho0*c0^2) - 3*f1*rho0 * <v^2> / 8]
-    F = -grad(U)
-
-Local minima of U are stable trapping sites for acoustic levitation.
-The simulation reveals multiple potential wells along the beam crossing
-region where particles would be confined.
-
-What linear superposition misses:
-----------------------------------
-1. Waveform steepening / shock formation: At >160 dB, energy transfers
-   to harmonics, reducing peak focal pressure below the linear prediction.
-
-2. Acoustic streaming: Time-averaged momentum transfer creates steady
-   convective flows (Eckart streaming), redistributing heat and affecting
-   particle dynamics.
-
-3. Parametric interaction: Two beams from different angles produce a
-   virtual source at their intersection via the quadratic nonlinearity,
-   generating sum/difference-frequency components.
-
-k-Wave approach: medium.BonA = 0.4 adds cumulative nonlinearity to the
-time-domain solver, capturing harmonic generation self-consistently.
+INTERACTION_WRITEUP = """
+╔══════════════════════════════════════════════════════════════════════║
+║                   INTERACTION MODEL WRITE-UP                         ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  Model: Linear Superposition                                         ║
+║  ─────────────────────────────                                       ║
+║  The total field is computed as the coherent (complex) sum of the    ║
+║  two individual array fields:                                        ║
+║                                                                      ║
+║      p_total(r) = p_array1(r) + p_array2(r)                          ║
+║                                                                      ║
+║  This preserves phase information: at the focal point, both beams    ║
+║  arrive in-phase → constructive interference → ~2× the individual    ║
+║  amplitude (6 dB gain). Away from focus, the relative phase varies   ║
+║  and the beams partially cancel.                                     ║
+║                                                                      ║
+║  Physical effect missed: Nonlinear acoustic interaction              ║
+║  ────────────────────────────────────────────────────────            ║
+║  At high SPLs (>140 dB, common in ultrasonic levitation), the        ║
+║  linear wave equation breaks down and the Westervelt equation        ║
+║  applies. The key nonlinear effects are:                             ║
+║                                                                      ║
+║  1. Harmonic generation: The fundamental (40 kHz) distorts into a    ║
+║     sawtooth, transferring energy to 80 kHz, 120 kHz, etc. At the    ║
+║     focal point where amplitude is highest, this steepening is       ║
+║     strongest, effectively broadening the frequency content.         ║
+║                                                                      ║
+║  2. Acoustic radiation force (Gor'kov potential): The time-averaged  ║
+║     nonlinear pressure creates a steady-state force field. In the    ║
+║     superposition of two beams, standing-wave nodes between them     ║
+║     produce trapping sites (used in acoustic levitation). Linear     ║
+║     superposition captures the interference pattern but not the      ║
+║     actual radiation force magnitude.                                ║
+║                                                                      ║
+║  3. Parametric interaction (difference frequency): When two beams    ║
+║     at slightly different frequencies intersect, nonlinearity        ║
+║     generates a difference-frequency component (demodulation).       ║
+║     Even at the same frequency, the interaction of beams from        ║
+║     different angles produces a virtual source at the intersection   ║
+║     with modified directivity. This is the basis of parametric       ║
+║     loudspeakers.                                                    ║
+║                                                                      ║
+║  Impact on field: Nonlinear effects would (a) reduce peak pressure   ║
+║  at focus below the linear prediction due to energy transfer to      ║
+║  harmonics, (b) sharpen the focal spot slightly, and (c) create a    ║
+║  time-averaged force landscape not captured by the linear model.     ║
+║                                                                      ║
+║  To model this, one would use k-Wave with medium.BonA = 0.4 (air),   ║
+║  which adds the B/A nonlinearity term to the governing equations,    ║
+║  or solve the Westervelt/KZK equation directly.                      ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║
 """
 
-
-NEXT_STEPS = """\
-WHAT I'D DO NEXT (2 hours)
-==========================
-
-With two more hours I would pursue three improvements. First, I would run
-the k-Wave simulation with medium.BonA enabled at progressively higher
-source amplitudes (50, 100, 500 Pa) to map where the perturbation theory
-breaks down -- this "nonlinearity onset" curve directly informs transducer
-drive-voltage sizing. Second, I would compute Gor'kov force trajectories
-by integrating particle equations of motion (including Stokes drag),
-producing an animation of particle capture and transport toward the
-trapping sites. Third, I would build a lightweight Streamlit interface
-letting the user drag the focal point and adjust array parameters in
-real time; the analytical method runs in <200 ms, well within interactive
-frame rates, making it immediately useful for design exploration.
+NEXT_STEPS = """
+╔══════════════════════════════════════════════════════════════════════║
+║                        WHAT I'D DO NEXT                              ║
+╠══════════════════════════════════════════════════════════════════════║
+║                                                                      ║
+║  With another 2 hours,  I'd add an interactive                       ║
+║  visualization (e.g., Plotly or a small Streamlit app) that lets the ║
+║  user drag the focal point and adjust array parameters in real time, ║
+║  watching the beam pattern update — the analytical method is fast    ║
+║  enough (<100 ms) to support this, and it would make the tool far    ║
+║  more useful for design exploration.                                 ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════║
 """
 
 
@@ -719,29 +644,30 @@ frame rates, making it immediately useful for design exploration.
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("\n" + "=" * 72)
-    print(f"  ULTRASONIC PHASED ARRAY SIMULATION")
-    print(f"  Two {N_ELEM}x{N_ELEM} arrays at {F0/1e3:.0f} kHz -> "
-          f"Focus at ({FOCAL_POINT[0]*100:.0f}, {FOCAL_POINT[1]*100:.0f}) cm")
-    print(f"  Domain: [{X_MIN*100:.0f}, {X_MAX*100:.0f}] x "
-          f"[{Y_MIN*100:.0f}, {Y_MAX*100:.0f}] cm")
-    print("  Linear superposition + nonlinear perturbation")
-    print("=" * 72 + "\n")
+    print("\n" + "─" * 70)
+    print("  ULTRASONIC PHASED ARRAY SIMULATION")
+    print("  Two 8×8 arrays at 40 kHz → Common focal point")
+    print("  Superposition model")
+    print("─" * 70 + "\n")
 
-    ana = run_analytical()
-    kw = run_kwave(enable_nonlinear=True)
+    # Run analytical simulation (always works)
+    p1, p2, p_total, X, Y = run_analytical_simulation()
 
-    print("\n" + "=" * 72)
-    print("  GENERATING PLOTS")
-    print("=" * 72)
-    make_plots(ana, kw)
+    # Attempt k-Wave simulation
+    kwave_result = run_kwave_simulation()
 
-    for name, text in [('assumptions_log.txt', ASSUMPTIONS),
-                       ('interaction_writeup.txt', INTERACTION_WRITEUP),
-                       ('next_steps.txt', NEXT_STEPS)]:
-        with open(OUTPUT_DIR / name, 'w') as f:
-            f.write(text)
-        print(f"  -> {OUTPUT_DIR / name}")
+    # Print deliverables
+    print(ASSUMPTIONS)
+    print(INTERACTION_WRITEUP)
+    print(NEXT_STEPS)
 
-    print(f"\n  All outputs in: {OUTPUT_DIR.resolve()}")
-    print("  Done.\n")
+    # Save text deliverables
+    with open(OUTPUT_DIR / 'assumptions_log.txt', 'w') as f:
+        f.write(ASSUMPTIONS)
+    with open(OUTPUT_DIR / 'interaction_writeup.txt', 'w') as f:
+        f.write(INTERACTION_WRITEUP)
+    with open(OUTPUT_DIR / 'next_steps.txt', 'w') as f:
+        f.write(NEXT_STEPS)
+
+    print(f"\nAll outputs saved to: {OUTPUT_DIR.resolve()}")
+    print("Done.")
