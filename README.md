@@ -5,7 +5,7 @@ Two N×N transducer arrays at 40 kHz beamsteered to a common focal point. Models
 
 ## Quick Start
 
-Using uv (recommended):
+Using [uv](https://docs.astral.sh/uv/) (recommended):
 
 uv add k-wave-python
 
